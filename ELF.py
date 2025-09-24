@@ -1,11 +1,12 @@
 import logging
+import os
 import sqlite3
 import uuid
 import asyncio
 import shutil
+from urllib.parse import urlparse
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, executor
-from aiogram.dispatcher.handler import CancelHandler
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
@@ -17,7 +18,9 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 # Инициализация бота
-API_TOKEN = '8466659548:AAFuu6zlFsptCI3SpYKWz3cKXvpEMSbhPjc'
+# Читаем токен из переменной окружения TOKEN; если не задан, используем значение из кода (небезопасно)
+API_TOKEN = os.getenv('TOKEN', '8466659548:AAFuu6zlFsptCI3SpYKWz3cKXvpEMSbhPjc')
+print("Token length:", len(API_TOKEN))
 bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
@@ -37,6 +40,9 @@ SPECIAL_SET_DEALS_IDS = {8110533761, 1727085454, 1098773494, 932555380, 81530707
 
 # Хранение ID сообщений для удаления
 user_messages = {}
+
+# In-memory storage for banned users (cache for quick checks and handler filter)
+banned_users = set()
 
 # Подключение к базе данных
 def init_db():
@@ -125,6 +131,17 @@ def init_db():
 
     conn.commit()
     conn.close()
+
+def load_banned_users():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute('SELECT user_id FROM users WHERE banned = 1')
+        rows = cur.fetchall()
+    finally:
+        conn.close()
+    banned_users.clear()
+    banned_users.update([r[0] for r in rows])
 
 def get_top_successful_users(limit: int = 10):
     conn = get_db_connection()
@@ -660,6 +677,11 @@ def set_ban(user_id: int, banned: bool, actor_id: int, reason: str = ''):
                    (actor_id, 'ban' if banned else 'unban', f'user_id={user_id}; reason={reason}'))
     conn.commit()
     conn.close()
+    # sync in-memory set
+    if banned:
+        banned_users.add(user_id)
+    else:
+        banned_users.discard(user_id)
 
 def admin_log(actor_id: int, action: str, details: str = ''):
     conn = get_db_connection()
@@ -939,33 +961,14 @@ def create_clickable_link(url, text=None):
     return f'<a href="{url}">{text}</a>'
 
 # Обработчики команд
-# Глобальные проверки: бан для любых сообщений
-@dp.message_handler(lambda m: is_banned(m.from_user.id))
-async def banned_guard_msg(message: types.Message):
+# Handler that matches any message from banned users (placed early)
+@dp.message_handler(user_id=banned_users)
+async def handle_banned_user_msg(message: types.Message):
     try:
         await bot.send_message(message.from_user.id, '⛔ Вы заблокированы. Обратитесь в поддержку.', parse_mode='HTML')
     except Exception:
         pass
     raise CancelHandler()
-
-@dp.callback_query_handler(lambda c: is_banned(c.from_user.id))
-async def banned_guard_cb(call: types.CallbackQuery):
-    try:
-        await bot.send_message(call.from_user.id, '⛔ Вы заблокированы. Обратитесь в поддержку.', parse_mode='HTML')
-    except Exception:
-        pass
-    try:
-        await call.answer()
-    except Exception:
-        pass
-    raise CancelHandler()
-
-@dp.message_handler(commands=['whoami'])
-async def cmd_whoami(message: types.Message):
-    uid = message.from_user.id
-    uname = message.from_user.username or ''
-    is_admin = '✅' if uid in ADMIN_IDS else '❌'
-    await send_temp_message(uid, f'ID: <code>{uid}</code>\nUsername: @{uname}\nAdmin: {is_admin}')
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.finish()
@@ -1024,7 +1027,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
 async def cmd_admin(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
     if user_id not in ADMIN_IDS:
-        logger.info(f"/admin denied for {user_id}")
         return
     # Регистрируем чат для последующей рассылки по чатам
     chat = message.chat
@@ -1048,6 +1050,46 @@ async def cmd_admin(message: types.Message, state: FSMContext):
         InlineKeyboardButton('📜 Логи (последние 20)', callback_data=admin_cb.new(section='logs', action='list', arg='0')),
     )
     await send_main_message(user_id, '🛡️ <b>Админ-панель</b>\nВы админ. Выберите раздел:', kb)
+
+# Commands for ban/unban via text commands (admins only)
+@dp.message_handler(commands=['ban'])
+async def cmd_ban(message: types.Message):
+    admin_id = message.from_user.id
+    if admin_id not in ADMIN_IDS:
+        return
+    args = (message.get_args() or '').strip()
+    if not args:
+        await send_temp_message(admin_id, 'Использование: /ban <user_id>')
+        return
+    try:
+        target = int(args.split()[0])
+    except Exception:
+        await send_temp_message(admin_id, 'Укажи корректный ID пользователя: /ban <user_id>')
+        return
+    set_ban(target, True, admin_id, reason='cmd')
+    # Try notifying the user
+    try:
+        await bot.send_message(target, '⛔ Вы заблокированы. Обратитесь в поддержку.', parse_mode='HTML')
+    except Exception:
+        pass
+    await send_temp_message(admin_id, f'🚫 Пользователь <code>{target}</code> заблокирован')
+
+@dp.message_handler(commands=['unban'])
+async def cmd_unban(message: types.Message):
+    admin_id = message.from_user.id
+    if admin_id not in ADMIN_IDS:
+        return
+    args = (message.get_args() or '').strip()
+    if not args:
+        await send_temp_message(admin_id, 'Использование: /unban <user_id>')
+        return
+    try:
+        target = int(args.split()[0])
+    except Exception:
+        await send_temp_message(admin_id, 'Укажи корректный ID пользователя: /unban <user_id>')
+        return
+    set_ban(target, False, admin_id, reason='cmd')
+    await send_temp_message(admin_id, f'✅ Пользователь <code>{target}</code> разбанен')
 
 @dp.callback_query_handler(admin_cb.filter())
 async def admin_router(call: types.CallbackQuery, callback_data: dict):
@@ -1721,9 +1763,43 @@ async def cmd_buy(message: types.Message):
 
 # Инициализация базы данных
 init_db()
+load_banned_users()
+
+# Настройки вебхука из окружения
+WEBHOOK_URL = os.getenv('WEBHOOK_URL', '').strip()
+WEBAPP_HOST = os.getenv('WEBAPP_HOST', '0.0.0.0')
+WEBAPP_PORT = int(os.getenv('WEBAPP_PORT', '8080'))
+
+async def on_startup_webhook(dp: Dispatcher):
+    if WEBHOOK_URL:
+        await bot.set_webhook(WEBHOOK_URL)
+        logger.info(f"Webhook set to {WEBHOOK_URL}")
+
+async def on_shutdown_webhook(dp: Dispatcher):
+    try:
+        await bot.delete_webhook()
+    except Exception:
+        pass
 
 if __name__ == '__main__':
     print("🚀 Запуск бота ELF OTC...")
     print("✅ База данных инициализирована")
-    print("🤖 Бот готов к работе!")
-    executor.start_polling(dp, skip_updates=True)
+    print(f"🔒 Заблокированных пользователей загружено: {len(banned_users)}")
+    if WEBHOOK_URL:
+        # Вебхук-режим
+        parsed = urlparse(WEBHOOK_URL)
+        webhook_path = parsed.path or '/'
+        print(f"🌐 Webhook mode on {WEBAPP_HOST}:{WEBAPP_PORT} -> {WEBHOOK_URL}")
+        executor.start_webhook(
+            dispatcher=dp,
+            webhook_path=webhook_path,
+            on_startup=on_startup_webhook,
+            on_shutdown=on_shutdown_webhook,
+            skip_updates=True,
+            host=WEBAPP_HOST,
+            port=WEBAPP_PORT,
+        )
+    else:
+        # Поллинг-режим (дефолтно для локальной разработки)
+        print("🟢 Polling mode (set WEBHOOK_URL to enable webhook)")
+        executor.start_polling(dp, skip_updates=True)
