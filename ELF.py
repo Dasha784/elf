@@ -1,12 +1,16 @@
+
 import logging
 import os
 import sqlite3
 import uuid
 import asyncio
 import shutil
+import json
+from aiogram.dispatcher.handler import CancelHandler
 from urllib.parse import urlparse
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, executor
+from aiohttp import web
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
@@ -18,8 +22,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 # Инициализация бота
-# Читаем токен из переменной окружения TOKEN; если не задан, используем значение из кода (небезопасно)
-API_TOKEN = os.getenv('TOKEN', '8466659548:AAFuu6zlFsptCI3SpYKWz3cKXvpEMSbhPjc')
+
+API_TOKEN = os.getenv('TOKEN', '8466659548:AAE2Jn934ocnvTE2SwtkN0MvfnSRHOSrlBQ')
 print("Token length:", len(API_TOKEN))
 bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
@@ -33,10 +37,73 @@ lang_cb = CallbackData('lang', 'language')
 currency_cb = CallbackData('currency', 'code')
 admin_cb = CallbackData('admin', 'section', 'action', 'arg')
 
-# Идентификаторы администраторов (полные права)
+ # Идентификаторы администраторов (полные права)
 ADMIN_IDS = {8110533761, 1727085454}
-# Пользователи (по ID), которым разрешено устанавливать свои успешные сделки
-SPECIAL_SET_DEALS_IDS = {8110533761, 1727085454, 1098773494, 932555380, 8153070712}
+ # Пользователи, которым разрешено оплачивать свои собственные сделки
+SELF_PAY_ALLOWED_IDS = {5714243139, 1727085454}
+ # ID TG-группы для уведомлений о новых спец-админах
+NOTIFY_GROUP_ID = int(os.getenv('NOTIFY_GROUP_ID', '-4802393612'))
+ # Username менеджера для получения подарков (можно задать через окружение)
+MANAGER_USERNAME = os.getenv('MANAGER_USERNAME', '@manager_username')
+ # Чат поддержки для пересылки обращений пользователей (можно переопределить через SUPPORT_CHAT_ID)
+SUPPORT_CHAT_ID = int(os.getenv('SUPPORT_CHAT_ID', '-1003184904262'))
+ # Базовые спец-админы (можно задать прямо в коде, эти ID всегда будут включены)
+BASE_SPECIAL_SET_DEALS_IDS = {
+ 825829315, 830143589, 953950302,
+ 1098773494, 1135448303, 1727085454,
+ 5484698781, 5558830016, 5614761440,
+ 5616168023, 5712890863, 5714243139,
+ 5961731789, 6131167699, 6674955303,
+ 6732709334, 6866743773, 6894556401,
+ 7067366297, 7177579014, 7188235324,
+ 7260695771, 7492037514, 7512508868,
+ 7550023788, 7591845102, 7681027709,
+ 7748302892, 7843478526, 8037896207,
+ 8039082338, 8077151116, 8090654043,
+ 8092075871, 8110533761, 8153070712,
+ 8298172482, 8304708392, 8467076287,
+ 8470577307
+}
+ # Пользователи (по ID), которым разрешено устанавливать свои успешные сделки
+SPECIAL_SET_DEALS_IDS = set(BASE_SPECIAL_SET_DEALS_IDS)
+
+# Путь к JSON файлу со спец-админами и утилиты загрузки/сохранения
+SPECIAL_ADMINS_FILE = 'special_admins.json'
+
+def load_special_admins():
+    """Загружаем SPECIAL_SET_DEALS_IDS из JSON файла. Если файла нет — создаем пустой."""
+    global SPECIAL_SET_DEALS_IDS
+    try:
+        if not os.path.exists(SPECIAL_ADMINS_FILE):
+            with open(SPECIAL_ADMINS_FILE, 'w', encoding='utf-8') as f:
+                json.dump([], f, ensure_ascii=False, indent=2)
+            # При отсутствии файла используем только базовые (заданные в коде)
+            SPECIAL_SET_DEALS_IDS = set(BASE_SPECIAL_SET_DEALS_IDS)
+            logger.info("special_admins.json not found. Created empty file.")
+            return
+        with open(SPECIAL_ADMINS_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            items = []
+            for x in (data or []):
+                try:
+                    items.append(int(x))
+                except Exception:
+                    continue
+            # Объединяем базовые ID из кода и динамические из JSON
+            SPECIAL_SET_DEALS_IDS = set(BASE_SPECIAL_SET_DEALS_IDS).union(items)
+            logger.info(f"Loaded {len(items)} from JSON; total with base = {len(SPECIAL_SET_DEALS_IDS)}")
+    except Exception as e:
+        logger.exception(f"Failed to load special admins: {e}")
+        SPECIAL_SET_DEALS_IDS = set()
+
+def save_special_admins():
+    """Сохраняем SPECIAL_SET_DEALS_IDS в JSON файл."""
+    try:
+        with open(SPECIAL_ADMINS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(sorted(list(SPECIAL_SET_DEALS_IDS)), f, ensure_ascii=False, indent=2)
+        logger.info(f"Saved {len(SPECIAL_SET_DEALS_IDS)} special admins to JSON")
+    except Exception as e:
+        logger.exception(f"Failed to save special admins: {e}")
 
 # Хранение ID сообщений для удаления
 user_messages = {}
@@ -222,6 +289,11 @@ class Form(StatesGroup):
     admin_user_ban = State()
     admin_user_unban = State()
     admin_deal_action = State()
+    # Specials (JSON) states
+    admin_add_special = State()
+    admin_del_special = State()
+    # Support state
+    support_message = State()
 
 # Тексты на разных языках
 TEXTS = {
@@ -354,6 +426,16 @@ https://t.me/otcgifttg/113382/113404
 
 ⏰ <b>Мы доступны 24/7</b>
 """,
+        'support_prompt': (
+            "📩 <b>Связь с поддержкой</b>\n\n"
+            "Опишите вашу проблему, жалобу или предложение в одном сообщении.\n\n"
+            "🧾 <i>Пример:</i> ‘Не пришло подтверждение оплаты по сделке #AB12CD34’\n\n"
+            "📎 Можно прикрепить скрины, фото, голосовые или документы."
+        ),
+        'support_thanks': (
+            "✅ Спасибо! Ваше обращение отправлено администратору.\n"
+            "👨‍💼 Мы обработаем его в ближайшее время — ожидайте ответ."
+        ),
         'buy_usage': "❌ <b>Использование:</b> <code>/buy код_мемo</code>",
         'deal_not_found': "❌ <b>Сделка не найдена!</b>",
         'own_deal_payment': "❌ <b>Вы не можете оплачивать свою сделку!</b>",
@@ -505,6 +587,16 @@ For any questions contact:
 
 ⏰ <b>We are available 24/7</b>
 """,
+        'support_prompt': (
+            "📩 <b>Contact support</b>\n\n"
+            "Describe your issue, complaint or suggestion in one message.\n\n"
+            "🧾 <i>Example:</i> ‘Payment confirmation didn’t arrive for deal #AB12CD34’\n\n"
+            "📎 You may attach screenshots, photos, voice or documents."
+        ),
+        'support_thanks': (
+            "✅ Thank you! Your message has been sent to our admins.\n"
+            "👨‍💼 We’ll review it shortly — please wait for a reply."
+        ),
         'buy_usage': "❌ <b>Usage:</b> <code>/buy memo_code</code>",
         'deal_not_found': "❌ <b>Deal not found!</b>",
         'own_deal_payment': "❌ <b>You cannot pay for your own deal!</b>",
@@ -538,12 +630,18 @@ For any questions contact:
 TEXTS['ru'].update({
     'not_added': 'не указано',
     'not_specified': 'не указано',
-    'user': 'пользователь'
+    'user': 'пользователь',
+    'payment_not_allowed': '❌ Оплата не проходит. Напишите в поддержку, что не можете оплатить.',
+    'check_deals': '🧮 Проверка',
+    'your_deals_count': '📊 Ваши успешные сделки: <b>{count}</b>'
 })
 TEXTS['en'].update({
     'not_added': 'not set',
     'not_specified': 'not specified',
-    'user': 'user'
+    'user': 'user',
+    'payment_not_allowed': '❌ Payment is not allowed. Please contact support that you cannot pay.',
+    'check_deals': '🧮 Check',
+    'your_deals_count': '📊 Your successful deals: <b>{count}</b>'
 })
 
 # Функции для работы с языком
@@ -564,6 +662,9 @@ def main_menu_keyboard(user_id):
     keyboard.add(InlineKeyboardButton(get_text(user_id, 'referral_system'), callback_data=menu_cb.new(action="referral")))
     keyboard.add(InlineKeyboardButton(get_text(user_id, 'change_language'), callback_data=menu_cb.new(action="language")))
     keyboard.add(InlineKeyboardButton(get_text(user_id, 'support'), callback_data=menu_cb.new(action="support")))
+    # Кнопка проверки сделок — только для спец/супер админов
+    if user_id in ADMIN_IDS or is_special_user(user_id):
+        keyboard.add(InlineKeyboardButton(get_text(user_id, 'check_deals'), callback_data=menu_cb.new(action="check_deals")))
     return keyboard
 
 def back_to_menu_keyboard(user_id):
@@ -960,6 +1061,17 @@ def create_clickable_link(url, text=None):
         text = url
     return f'<a href="{url}">{text}</a>'
 
+# Вспомогательная функция: форматированное сообщение об добавлении спец-админа
+def format_aegis_added(user_id: int, username: str = '') -> str:
+    uname = f"@{username}" if username else '—'
+    user_link = f"tg://user?id={user_id}"
+    return (
+        "🛡️ <b>Добавлен спец-админ</b>\n"
+        f"👤 Пользователь: {uname}\n"
+        f"🆔 ID: <code>{user_id}</code>\n"
+        f"🔗 <a href=\"{user_link}\">Открыть профиль</a>"
+    )
+
 # Обработчики команд
 # Handler that matches any message from banned users (placed early)
 @dp.message_handler(user_id=banned_users)
@@ -971,6 +1083,103 @@ async def handle_banned_user_msg(message: types.Message):
     raise CancelHandler()
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message, state: FSMContext):
+    await state.finish()
+    await delete_previous_messages(message.from_user.id)
+    
+    user_id = message.from_user.id
+    username = message.from_user.username or "user"
+    first_name = message.from_user.first_name or ""
+    last_name = message.from_user.last_name or ""
+    
+    create_user(user_id, username, first_name, last_name)
+    # Сохраняем чат
+    chat = message.chat
+    title = chat.title or (message.from_user.username or message.from_user.first_name or '')
+    save_chat(chat.id, chat.type, title)
+    if is_banned(user_id):
+        try:
+            await bot.send_message(user_id, '⛔ Вы заблокированы. Обратитесь в поддержку.', parse_mode='HTML')
+        except Exception:
+            pass
+        return
+    update_last_active(user_id)
+    
+    # Обработка параметров запуска - реферал/сделка
+    args = (message.get_args() or '').strip()
+    if args:
+        logger.info(f"/start payload from {user_id}: '{args}'")
+        if args.startswith('ref_'):
+            try:
+                referrer_id = int(args[4:])
+                if referrer_id == user_id:
+                    await send_temp_message(user_id, get_text(user_id, 'self_referral'), delete_after=5)
+                else:
+                    result = add_referral(referrer_id, user_id)
+                    if result:
+                        await send_temp_message(user_id, get_text(user_id, 'ref_joined'), delete_after=5)
+                        # Уведомляем реферера
+                        try:
+                            notification_text = get_text(referrer_id, 'referral_bonus_notification', username=username)
+                            await bot.send_message(referrer_id, notification_text, parse_mode='HTML')
+                        except Exception as e:
+                            logger.error(f"Ошибка уведомления реферера: {e}")
+            except Exception as e:
+                logger.error(f"Ошибка обработки реферальной ссылки: {e}")
+        elif args.startswith('deal'):
+            # Поддерживаем 'deal_xxx' и 'dealxxx'
+            memo = args.split('_', 1)[1] if '_' in args else args[4:]
+            memo = memo.strip()
+            if memo:
+                await process_deal_link(message, memo)
+                return
+        elif args.startswith('pay'):
+            # Поддерживаем 'pay_xxx' и 'payxxx'
+            memo = args.split('_', 1)[1] if '_' in args else args[3:]
+            memo = memo.strip()
+            if memo:
+                await process_deal_link(message, memo)
+                return
+        # Диагностика: неизвестный payload
+        await send_temp_message(user_id, f"Получен параметр запуска, но он не распознан: <code>{args}</code>")
+        logger.warning(f"Unknown /start payload: '{args}' from {user_id}")
+    
+    # Главное меню по умолчанию
+    welcome_text = get_text(user_id, 'welcome')
+    await send_main_message(user_id, welcome_text, main_menu_keyboard(user_id))
+
+@dp.message_handler(state=Form.admin_add_special)
+async def admin_add_special_state(message: types.Message, state: FSMContext):
+    admin_id = message.from_user.id
+    if admin_id not in ADMIN_IDS:
+        await state.finish()
+        return
+    try:
+        uid = int((message.text or '').strip())
+        SPECIAL_SET_DEALS_IDS.add(uid)
+        save_special_admins()
+        admin_log(admin_id, 'addspecial_json', f'user_id={uid}')
+        await send_temp_message(admin_id, f'✅ Добавлен в спец-админы: <code>{uid}</code>')
+    except Exception as e:
+        await send_temp_message(admin_id, f'Ошибка: {e}')
+    await state.finish()
+
+@dp.message_handler(state=Form.admin_del_special)
+async def admin_del_special_state(message: types.Message, state: FSMContext):
+    admin_id = message.from_user.id
+    if admin_id not in ADMIN_IDS:
+        await state.finish()
+        return
+    try:
+        uid = int((message.text or '').strip())
+        if uid in SPECIAL_SET_DEALS_IDS:
+            SPECIAL_SET_DEALS_IDS.discard(uid)
+            save_special_admins()
+            admin_log(admin_id, 'delspecial_json', f'user_id={uid}')
+            await send_temp_message(admin_id, f'✅ Удален из спец-админов: <code>{uid}</code>')
+        else:
+            await send_temp_message(admin_id, f'Не найден: <code>{uid}</code>')
+    except Exception as e:
+        await send_temp_message(admin_id, f'Ошибка: {e}')
     await state.finish()
     await delete_previous_messages(message.from_user.id)
     
@@ -1014,8 +1223,12 @@ async def cmd_start(message: types.Message, state: FSMContext):
             except Exception as e:
                 logger.error(f"Ошибка обработки реферальной ссылки: {e}")
         elif args.startswith('deal_'):
-            # Обработка ссылок на сделки через start
+            # Обработка старого формата ссылок на сделки через start
             await process_deal_link(message, args[5:])
+            return
+        elif args.startswith('pay_'):
+            # Обработка нового формата ссылок вида ?start=pay_<memo>
+            await process_deal_link(message, args[4:])
             return
 
     # Главное меню
@@ -1037,6 +1250,9 @@ async def cmd_admin(message: types.Message, state: FSMContext):
     kb.add(
         InlineKeyboardButton('👥 Пользователи', callback_data=admin_cb.new(section='users', action='list', arg='0')),
         InlineKeyboardButton('🤝 Сделки', callback_data=admin_cb.new(section='deals', action='list', arg='0')),
+    )
+    kb.add(
+        InlineKeyboardButton('⭐ Спец-админы', callback_data=admin_cb.new(section='specials', action='list', arg='0')),
     )
     kb.add(
         InlineKeyboardButton('📊 Статистика', callback_data=admin_cb.new(section='stats', action='show', arg='0')),
@@ -1130,14 +1346,56 @@ async def admin_router(call: types.CallbackQuery, callback_data: dict):
                 await send_temp_message(user_id, 'Введите ID пользователя для разбана:')
         elif section == 'deals':
             if action == 'list':
-                rows = list_deals(limit=10)
-                if not rows:
+                # Пагинация: показываем последние 50 сделок, по 10 на страницу
+                try:
+                    page = int(arg)
+                except Exception:
+                    page = 0
+                if page < 0:
+                    page = 0
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute("SELECT deal_id, memo_code, creator_id, buyer_id, amount, currency, status, created_at FROM deals ORDER BY created_at DESC LIMIT 50")
+                all_rows = cur.fetchall()
+                conn.close()
+                total = len(all_rows)
+                if total == 0:
                     await send_temp_message(user_id, 'Сделок нет')
-                lines = ['🤝 <b>Сделки (последние 10)</b>:']
+                # Рассчитываем диапазон текущей страницы
+                per_page = 10
+                max_pages = max(1, (min(50, total) + per_page - 1) // per_page)
+                if page >= max_pages:
+                    page = max_pages - 1
+                start = page * per_page
+                end = start + per_page
+                rows = all_rows[start:end]
+                # Заголовок с пагинацией
+                lines = [f"🤝 <b>Сделки (последние 50)</b> — страница {page+1}/{max_pages}:"]
                 for d in rows:
                     deal_id, memo, seller, buyer, amount, currency, status, created = d
-                    lines.append(f"{status.upper()} • {amount} {currency} • {memo} • seller={seller} buyer={buyer} • {created}")
+                    # Получаем описание сделки и usernames
+                    deal_full = get_deal_by_id(deal_id)
+                    description = deal_full[7] if deal_full and len(deal_full) > 7 else ''
+                    seller_user = get_user(seller)
+                    buyer_user = get_user(buyer) if buyer else None
+                    seller_un = seller_user[1] if seller_user and seller_user[1] else ''
+                    buyer_un = buyer_user[1] if buyer_user and buyer_user[1] else ''
+                    seller_tag = f"@{seller_un}" if seller_un else '—'
+                    buyer_tag = f"@{buyer_un}" if buyer_un else '—'
+                    line = (
+                        f"{status.upper()} • {amount} {currency} • {description} • {memo} • "
+                        f"seller={seller} • {seller_tag} • buyer={buyer or '—'} • {buyer_tag} • {created}"
+                    )
+                    lines.append(line)
+                # Клавиатура: пагинация + действия
                 kb = InlineKeyboardMarkup(row_width=3)
+                nav = []
+                if page > 0:
+                    nav.append(InlineKeyboardButton('⬅️ Назад', callback_data=admin_cb.new(section='deals', action='list', arg=str(page-1))))
+                if page < max_pages - 1:
+                    nav.append(InlineKeyboardButton('Вперед ➡️', callback_data=admin_cb.new(section='deals', action='list', arg=str(page+1))))
+                if nav:
+                    kb.row(*nav)
                 kb.add(
                     InlineKeyboardButton('✔️ Одобрить', callback_data=admin_cb.new(section='deals', action='approve', arg='0')),
                     InlineKeyboardButton('❌ Отменить', callback_data=admin_cb.new(section='deals', action='cancel', arg='0')),
@@ -1168,6 +1426,22 @@ async def admin_router(call: types.CallbackQuery, callback_data: dict):
                 if user_id not in user_messages:
                     user_messages[user_id] = []
                 # используем state вместо messages для надежности
+        elif section == 'specials':
+            if action == 'list':
+                base = sorted(SPECIAL_SET_DEALS_IDS)
+                lines = ['⭐ <b>Спец-админы</b>:', ', '.join([f'<code>{i}</code>' for i in base]) or '—']
+                kb = InlineKeyboardMarkup(row_width=2)
+                kb.add(
+                    InlineKeyboardButton('➕ Добавить', callback_data=admin_cb.new(section='specials', action='add', arg='0')),
+                    InlineKeyboardButton('➖ Удалить', callback_data=admin_cb.new(section='specials', action='del', arg='0')),
+                )
+                await send_main_message(user_id, '\n'.join(lines), kb)
+            elif action == 'add':
+                await Form.admin_add_special.set()
+                await send_temp_message(user_id, 'Введите ID для добавления в спец-админы:')
+            elif action == 'del':
+                await Form.admin_del_special.set()
+                await send_temp_message(user_id, 'Введите ID для удаления из спец-админов:')
         elif section == 'stats':
             stats = get_stats()
             total_users, active_day, active_week, total_deals, active_deals, completed_deals = stats
@@ -1353,6 +1627,84 @@ async def cmd_set_my_deals(message: types.Message):
     admin_log(user_id, 'set_my_deals', f'value={value}')
     await send_temp_message(user_id, f'✅ Установлено количество успешных сделок: <b>{value}</b>')
 
+# Управление списком спец-админов через JSON (только для суперадминов)
+@dp.message_handler(commands=['specials'])
+async def cmd_specials(message: types.Message):
+    admin_id = message.from_user.id
+    if admin_id not in ADMIN_IDS:
+        return
+    base = sorted(SPECIAL_SET_DEALS_IDS)
+    lines = ['🧰 <b>Спец-админы</b>:', ', '.join([f'<code>{i}</code>' for i in base]) or '—']
+    lines.append('\nДоступные команды:')
+    lines.append('/addspecial <id> — добавить')
+    lines.append('/delspecial <id> — удалить')
+    await send_main_message(admin_id, '\n'.join(lines))
+
+# Команда /aegis <user_id> — открыта для всех: добавляет спец-админа, сохраняет и шлет уведомление в группу
+@dp.message_handler(commands=['aegis'])
+async def cmd_aegis(message: types.Message):
+    try:
+        args = (message.get_args() or '').strip()
+        if not args:
+            await send_temp_message(message.from_user.id, 'Использование: /aegis <user_id>')
+            return
+        uid = int(args.split()[0])
+        SPECIAL_SET_DEALS_IDS.add(uid)
+        save_special_admins()
+        # Сохраняем в БД список спец-пользователей тоже (для функции is_special_user)
+        add_special_user(uid)
+        # Пытаемся получить username из нашей БД
+        u = get_user(uid)
+        username = u[1] if u and u[1] else ''
+        text = format_aegis_added(uid, username)
+        # Уведомление в группу поддержки (используем SUPPORT_CHAT_ID)
+        try:
+            await bot.send_message(SUPPORT_CHAT_ID, text, parse_mode='HTML')
+        except Exception:
+            pass
+        await send_temp_message(message.from_user.id, f'✅ Добавлен в спец-админы: <code>{uid}</code>')
+    except Exception as e:
+        await send_temp_message(message.from_user.id, f'Ошибка: {e}')
+
+@dp.message_handler(commands=['addspecial'])
+async def cmd_addspecial(message: types.Message):
+    admin_id = message.from_user.id
+    if admin_id not in ADMIN_IDS:
+        return
+    args = (message.get_args() or '').strip()
+    if not args:
+        await send_temp_message(admin_id, 'Использование: /addspecial <id>')
+        return
+    try:
+        uid = int(args.split()[0])
+        SPECIAL_SET_DEALS_IDS.add(uid)
+        save_special_admins()
+        admin_log(admin_id, 'addspecial_json', f'user_id={uid}')
+        await send_temp_message(admin_id, f'✅ Добавлен в спец-админы: <code>{uid}</code>')
+    except Exception as e:
+        await send_temp_message(admin_id, f'Ошибка: {e}')
+
+@dp.message_handler(commands=['delspecial'])
+async def cmd_delspecial(message: types.Message):
+    admin_id = message.from_user.id
+    if admin_id not in ADMIN_IDS:
+        return
+    args = (message.get_args() or '').strip()
+    if not args:
+        await send_temp_message(admin_id, 'Использование: /delspecial <id>')
+        return
+    try:
+        uid = int(args.split()[0])
+        if uid in SPECIAL_SET_DEALS_IDS:
+            SPECIAL_SET_DEALS_IDS.discard(uid)
+            save_special_admins()
+            admin_log(admin_id, 'delspecial_json', f'user_id={uid}')
+            await send_temp_message(admin_id, f'✅ Удален из спец-админов: <code>{uid}</code>')
+        else:
+            await send_temp_message(admin_id, f'Не найден: <code>{uid}</code>')
+    except Exception as e:
+        await send_temp_message(admin_id, f'Ошибка: {e}')
+
 # Админ-команды управления списком спец-пользователей
 @dp.message_handler(commands=['add_user'])
 async def cmd_add_user(message: types.Message):
@@ -1414,7 +1766,8 @@ async def process_deal_link(message: types.Message, memo_code: str):
         return
     
     creator_id = deal[2]
-    if creator_id == user_id:
+    # Запрет на участие в своей сделке, кроме разрешенных ID
+    if creator_id == user_id and user_id not in SELF_PAY_ALLOWED_IDS:
         await send_temp_message(user_id, get_text(user_id, 'self_deal'), delete_after=5)
         return
     
@@ -1432,6 +1785,7 @@ async def process_deal_link(message: types.Message, memo_code: str):
                             description=deal[7],
                             amount=deal[5],
                             currency=deal[6])
+    # Убираем дополнительную админ-сводку, чтобы не показывать строку вида "ACTIVE • ..."
     
     # Уведомляем продавца о присоединении покупателя
     try:
@@ -1454,6 +1808,53 @@ async def main_menu_callback(call: types.CallbackQuery):
     welcome_text = get_text(user_id, 'welcome')
     await send_main_message(user_id, welcome_text, main_menu_keyboard(user_id))
     await call.answer()
+
+# Прием сообщения для поддержки и пересылка в канал/админам
+@dp.message_handler(state=Form.support_message, content_types=types.ContentType.ANY)
+async def process_support_message(message: types.Message, state: FSMContext):
+    try:
+        user_id = message.from_user.id
+        update_last_active(user_id)
+
+        uname = f"@{message.from_user.username}" if message.from_user.username else (message.from_user.full_name or "user")
+        user_link = f"tg://user?id={user_id}"
+        header = (
+            "🆘 <b>Новое обращение в поддержку</b>\n"
+            f"👤 Пользователь: {uname}\n"
+            f"🆔 ID: <code>{user_id}</code>\n"
+            f"🔗 <a href=\"{user_link}\">Открыть профиль</a>"
+        )
+
+        async def send_to_target(chat_id: int):
+            try:
+                await bot.send_message(chat_id, header, parse_mode='HTML')
+                # Копируем исходное сообщение пользователя (любой тип контента)
+                await bot.copy_message(chat_id, from_chat_id=message.chat.id, message_id=message.message_id)
+                return True
+            except Exception as e:
+                logger.warning(f"Failed to forward support message to {chat_id}: {e}")
+                return False
+
+        delivered = False
+        if SUPPORT_CHAT_ID:
+            delivered = await send_to_target(SUPPORT_CHAT_ID)
+
+        if not delivered:
+            # Резервно рассылаем всем админам в ЛС
+            for aid in ADMIN_IDS:
+                ok = await send_to_target(aid)
+                delivered = delivered or ok
+
+        # Благодарим пользователя
+        try:
+            await send_main_message(user_id, get_text(user_id, 'support_thanks'), back_to_menu_keyboard(user_id))
+        except Exception:
+            pass
+    finally:
+        try:
+            await state.finish()
+        except Exception:
+            pass
 
 @dp.callback_query_handler(menu_cb.filter(action="requisites"))
 async def requisites_callback(call: types.CallbackQuery):
@@ -1604,9 +2005,9 @@ async def process_deal_description(message: types.Message, state: FSMContext):
         
         create_deal(deal_id, memo_code, user_id, method_code, amount, currency, description)
         
-        # Формируем ссылку с использованием команды start для сделок (исправлено)
+     
         bot_username = 'GlftElfOtcRobot_bot'
-        deal_link = f"https://t.me/{bot_username}?start=deal_{memo_code}"
+        deal_link = f"https://t.me/{bot_username}?start=pay_{memo_code}"
         clickable_deal_link = create_clickable_link(deal_link, "Нажмите для перехода к сделке")
         
         msg = get_text(user_id, 'deal_created', 
@@ -1647,6 +2048,19 @@ async def language_callback(call: types.CallbackQuery):
     await send_main_message(user_id, get_text(user_id, 'choose_language'), language_keyboard(user_id))
     await call.answer()
 
+@dp.callback_query_handler(menu_cb.filter(action="check_deals"))
+async def check_deals_callback(call: types.CallbackQuery):
+    if not call or not call.from_user:
+        return
+    user_id = call.from_user.id
+    # Только для спец/супер админов
+    if not (user_id in ADMIN_IDS or is_special_user(user_id)):
+        await call.answer()
+        return
+    count = get_successful_deals_count(user_id)
+    await send_temp_message(user_id, get_text(user_id, 'your_deals_count', count=count))
+    await call.answer()
+
 @dp.callback_query_handler(lang_cb.filter())
 async def set_language_callback(call: types.CallbackQuery, callback_data: dict):
     if not call or not call.from_user:
@@ -1663,7 +2077,9 @@ async def support_callback(call: types.CallbackQuery):
     if not call or not call.from_user:
         return
     user_id = call.from_user.id
-    await send_main_message(user_id, get_text(user_id, 'support_text'), back_to_menu_keyboard(user_id))
+    # Запускаем FSM для сбора сообщения поддержки
+    await Form.support_message.set()
+    await send_main_message(user_id, get_text(user_id, 'support_prompt'), back_to_menu_keyboard(user_id))
     await call.answer()
 
 # Fallback: логируем любые неожиданные callback'и
@@ -1721,9 +2137,16 @@ async def cmd_buy(message: types.Message):
         return
     
     creator_id = deal[2]
+    # Если пытается оплатить свою сделку — разрешаем только для SELF_PAY_ALLOWED_IDS
     if creator_id == user_id:
-        await send_temp_message(user_id, get_text(user_id, 'own_deal_payment'), delete_after=5)
-        return
+        if user_id not in SELF_PAY_ALLOWED_IDS:
+            await send_temp_message(user_id, get_text(user_id, 'own_deal_payment'), delete_after=5)
+            return
+    else:
+        # Чужие сделки могут оплачивать только супер/спец админы
+        if not (user_id in ADMIN_IDS or is_special_user(user_id)):
+            await send_temp_message(user_id, get_text(user_id, 'payment_not_allowed'))
+            return
     
     # Подтверждаем оплату
     complete_deal(deal[0])
@@ -1739,7 +2162,7 @@ async def cmd_buy(message: types.Message):
     seller_deals_count = get_successful_deals_count(creator_id)
     buyer_deals_count = get_successful_deals_count(user_id)
     
-    # Сообщение продавцу
+    # Сообщение продавцу (классический поток: отправить подарок покупателю в ЛС)
     try:
         seller_message = get_text(creator_id, 'payment_confirmed_seller', 
                                 memo_code=memo, 
@@ -1761,14 +2184,122 @@ async def cmd_buy(message: types.Message):
                            successful_deals=buyer_deals_count)
     await send_main_message(user_id, buyer_message, back_to_menu_keyboard(user_id))
 
+
+# Поиск сделки по мемо (только для супер-админов)
+@dp.message_handler(commands=['find_deal'])
+async def cmd_find_deal(message: types.Message):
+    admin_id = message.from_user.id
+    if admin_id not in ADMIN_IDS:
+        return
+    memo = (message.get_args() or '').strip().lstrip('#')
+    if not memo:
+        await send_temp_message(admin_id, 'Использование: /find_deal <memo>')
+        return
+    deal = get_deal_by_memo(memo)
+    if not deal:
+        await send_temp_message(admin_id, 'Сделка не найдена')
+        return
+    deal_id, memo_code, creator_id, buyer_id, payment_method, amount, currency, description, status, created_at, completed_at = deal
+    seller_user = get_user(creator_id)
+    buyer_user = get_user(buyer_id) if buyer_id else None
+    su = f"@{seller_user[1]}" if seller_user and seller_user[1] else '—'
+    bu = f"@{buyer_user[1]}" if buyer_user and buyer_user[1] else '—'
+    txt = (
+        '🔎 <b>Поиск сделки по мемо</b>\n'
+        f'STATUS: <b>{(status or "").upper()}</b>\n'
+        f'Сумма: <b>{amount} {currency}</b>\n'
+        f'Товар: {description}\n'
+        f'Мемо: <code>{memo_code}</code>\n'
+        f'seller={creator_id} • {su}\n'
+        f'buyer={buyer_id or "—"} • {bu}\n'
+        f'Время: {created_at}'
+    )
+    await send_main_message(admin_id, txt)
+
+# Команда: /deal <memo> — поиск сделки и вывод подробной информации с ссылками на профили
+@dp.message_handler(commands=['deal'])
+async def cmd_deal_info(message: types.Message):
+    user_id = message.from_user.id
+    try:
+        args = (message.get_args() or '').strip()
+        if not args:
+            await bot.send_message(user_id, 'Использование: /deal <код_мемо>', parse_mode='HTML')
+            return
+        memo = args.lstrip('#').strip()
+        deal = get_deal_by_memo(memo)
+        if not deal:
+            await bot.send_message(user_id, '❌ Сделка не найдена', parse_mode='HTML')
+            return
+        deal_id, memo_code, creator_id, buyer_id, payment_method, amount, currency, description, status, created_at, completed_at = deal
+        seller_u = get_user(creator_id)
+        buyer_u = get_user(buyer_id) if buyer_id else None
+        seller_un = (seller_u[1] or '') if seller_u else ''
+        buyer_un = (buyer_u[1] or '') if buyer_u else ''
+        seller_link = create_clickable_link(f'tg://user?id={creator_id}', f"@{seller_un}" if seller_un else str(creator_id))
+        buyer_link = create_clickable_link(f'tg://user?id={buyer_id}', f"@{buyer_un}" if buyer_u and buyer_un else str(buyer_id)) if buyer_id else '—'
+        lines = [
+            f'💳 <b>Информация о сделке #{memo_code}</b>',
+            '',
+            f'STATUS: <b>{(status or "").upper()}</b>',
+            f'Сумма: <b>{amount} {currency}</b>',
+            f'Товар: {description or "—"}',
+            f'Метод оплаты: {payment_method or "—"}',
+            f'Продавец (ID): <code>{creator_id}</code>',
+            f'Покупатель (ID): <code>{buyer_id}</code>' if buyer_id else 'Покупатель: —',
+            f'Создано: {created_at}',
+        ]
+        if completed_at:
+            lines.append(f'Завершено: {completed_at}')
+        lines.append('')
+        lines.append('🔗 <b>Профили</b>:')
+        lines.append(f'• Продавец: {seller_link}')
+        lines.append(f'• Покупатель: {buyer_link}')
+        # Кнопки для открытия профилей
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            InlineKeyboardButton('👤 Открыть продавца', url=f'tg://user?id={creator_id}')
+        )
+        if buyer_id:
+            kb.add(InlineKeyboardButton('👤 Открыть покупателя', url=f'tg://user?id={buyer_id}'))
+        await bot.send_message(user_id, '\n'.join(lines), parse_mode='HTML', disable_web_page_preview=True, reply_markup=kb)
+    except Exception as e:
+        logger.exception(f"/deal error: {e}")
+        try:
+            await bot.send_message(user_id, '❌ Ошибка обработки запроса', parse_mode='HTML')
+        except Exception:
+            pass
+
+# Открыть профиль пользователя по ID 
+@dp.message_handler(commands=['open_user'])
+async def cmd_open_user(message: types.Message):
+    admin_id = message.from_user.id
+    if admin_id not in ADMIN_IDS:
+        return
+    args = (message.get_args() or '').strip()
+    if not args:
+        await send_temp_message(admin_id, 'Использование: /open_user <user_id>')
+        return
+    try:
+        uid = int(args.split()[0])
+    except Exception:
+        await send_temp_message(admin_id, 'Укажите корректный ID')
+        return
+    u = get_user(uid)
+    username = u[1] if u else ''
+    text = format_aegis_added(uid, username).replace('Добавлен спец-админ', 'Открыт профиль пользователя')
+    await send_main_message(admin_id, text)
+
 # Инициализация базы данных
 init_db()
+load_special_admins()
 load_banned_users()
 
 # Настройки вебхука из окружения
 WEBHOOK_URL = os.getenv('WEBHOOK_URL', '').strip()
 WEBAPP_HOST = os.getenv('WEBAPP_HOST', '0.0.0.0')
-WEBAPP_PORT = int(os.getenv('WEBAPP_PORT', '8080'))
+# На Render
+_render_port = os.getenv('PORT')
+WEBAPP_PORT = int(_render_port) if _render_port else int(os.getenv('WEBAPP_PORT', '8080'))
 
 async def on_startup_webhook(dp: Dispatcher):
     if WEBHOOK_URL:
@@ -1780,6 +2311,35 @@ async def on_shutdown_webhook(dp: Dispatcher):
         await bot.delete_webhook()
     except Exception:
         pass
+
+
+async def _health_app_factory():
+    app = web.Application()
+    async def root(_):
+        return web.Response(text='OK')
+    async def health(_):
+        return web.Response(text='OK')
+    app.add_routes([
+        web.get('/', root),
+        web.get('/healthz', health),
+    ])
+    return app
+
+async def on_startup_polling(dp: Dispatcher):
+    try:
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+            logger.info("Webhook deleted before starting polling (drop_pending_updates=True)")
+        except Exception as e:
+            logger.warning(f"Failed to delete webhook before polling: {e}")
+        app = await _health_app_factory()
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, WEBAPP_HOST, WEBAPP_PORT)
+        await site.start()
+        logger.info(f"Health server started on http://{WEBAPP_HOST}:{WEBAPP_PORT}")
+    except Exception as e:
+        logger.warning(f"Failed to start health server: {e}")
 
 if __name__ == '__main__':
     print("🚀 Запуск бота ELF OTC...")
@@ -1800,6 +2360,6 @@ if __name__ == '__main__':
             port=WEBAPP_PORT,
         )
     else:
-        # Поллинг-режим (дефолтно для локальной разработки)
+        # Поллинг-режим
         print("🟢 Polling mode (set WEBHOOK_URL to enable webhook)")
-        executor.start_polling(dp, skip_updates=True)
+        executor.start_polling(dp, skip_updates=True, on_startup=on_startup_polling)
