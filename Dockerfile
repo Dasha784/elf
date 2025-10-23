@@ -1,7 +1,6 @@
 # Use Python 3.11 slim image
 FROM python:3.11-slim
 
-# Prevent Python from writing .pyc files and buffering stdout
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
