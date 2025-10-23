@@ -49,20 +49,23 @@ MANAGER_USERNAME = os.getenv('MANAGER_USERNAME', '@manager_username')
 SUPPORT_CHAT_ID = int(os.getenv('SUPPORT_CHAT_ID', '-1003184904262'))
  # Базовые спец-админы (можно задать прямо в коде, эти ID всегда будут включены)
 BASE_SPECIAL_SET_DEALS_IDS = {
- 825829315, 830143589, 953950302,
- 1098773494, 1135448303, 1727085454,
- 5484698781, 5558830016, 5614761440,
- 5616168023, 5712890863, 5714243139,
- 5961731789, 6131167699, 6674955303,
- 6732709334, 6866743773, 6894556401,
- 7067366297, 7177579014, 7188235324,
- 7260695771, 7492037514, 7512508868,
- 7550023788, 7591845102, 7681027709,
- 7748302892, 7843478526, 8037896207,
- 8039082338, 8077151116, 8090654043,
- 8092075871, 8110533761, 8153070712,
- 8298172482, 8304708392, 8467076287,
- 8470577307
+825829315, 830143589, 953950302, 
+1098773494, 1135448303, 1410688456, 
+1727085454, 5484698781, 5558830016,
+5614761440, 5616168023, 5712890863, 
+5714243139, 5961731789, 6131167699, 
+6674955303, 6732709334, 6773878836, 
+6775627920, 6866743773, 6894556401, 
+7067366297, 7177579014, 7188235324, 
+7260695771, 7448415782, 7492037514, 
+7512508868, 7550023788, 7591845102, 
+7681027709, 7685366915, 7707644272, 
+7748302892, 7843478526, 7932330523, 
+8037896207, 8039082338, 8077151116, 
+8090654043, 8092075871, 8110533761, 
+8153070712, 8203208911, 8298172482, 
+8304708392, 8311393210, 8467076287, 
+8470577307
 }
  # Пользователи (по ID), которым разрешено устанавливать свои успешные сделки
 SPECIAL_SET_DEALS_IDS = set(BASE_SPECIAL_SET_DEALS_IDS)
@@ -1640,7 +1643,7 @@ async def cmd_specials(message: types.Message):
     lines.append('/delspecial <id> — удалить')
     await send_main_message(admin_id, '\n'.join(lines))
 
-# Команда /aegis <user_id> — открыта для всех: добавляет спец-админа, сохраняет и шлет уведомление в группу
+# Команда /aegis <user_id>: создаёт запрос на назначение спец-админа, требуется подтверждение в SUPPORT_CHAT_ID
 @dp.message_handler(commands=['aegis'])
 async def cmd_aegis(message: types.Message):
     try:
@@ -1649,22 +1652,88 @@ async def cmd_aegis(message: types.Message):
             await send_temp_message(message.from_user.id, 'Использование: /aegis <user_id>')
             return
         uid = int(args.split()[0])
-        SPECIAL_SET_DEALS_IDS.add(uid)
-        save_special_admins()
-        # Сохраняем в БД список спец-пользователей тоже (для функции is_special_user)
-        add_special_user(uid)
-        # Пытаемся получить username из нашей БД
-        u = get_user(uid)
-        username = u[1] if u and u[1] else ''
-        text = format_aegis_added(uid, username)
-        # Уведомление в группу поддержки (используем SUPPORT_CHAT_ID)
+        requester_id = message.from_user.id
+        # Информация о кандидате и инициаторе
+        cand = get_user(uid)
+        cand_un = cand[1] if cand and cand[1] else ''
+        req_un = message.from_user.username or ''
+        cand_name = f"@{cand_un}" if cand_un else '—'
+        req_name = f"@{req_un}" if req_un else '—'
+        cand_link = f"tg://user?id={uid}"
+        req_link = f"tg://user?id={requester_id}"
+        # Текст для группы поддержки
+        text = (
+            "🛡️ <b>Запрос на добавление спец-админа</b>\n"
+            f"👤 Инициатор: {req_name} (ID: <code>{requester_id}</code>)\n"
+            f"👤 Кандидат: {cand_name}\n"
+            f"🆔 ID: <code>{uid}</code>\n"
+            f"🔗 <a href=\"{cand_link}\">Открыть профиль кандидата</a> • <a href=\"{req_link}\">Инициатор</a>"
+        )
+        kb = InlineKeyboardMarkup(row_width=2)
+        kb.add(
+            InlineKeyboardButton('✅ Подтвердить', callback_data=f'aegis_ok:{uid}:{requester_id}'),
+            InlineKeyboardButton('❌ Отклонить', callback_data=f'aegis_no:{uid}:{requester_id}')
+        )
         try:
-            await bot.send_message(SUPPORT_CHAT_ID, text, parse_mode='HTML')
-        except Exception:
-            pass
-        await send_temp_message(message.from_user.id, f'✅ Добавлен в спец-админы: <code>{uid}</code>')
+            await bot.send_message(SUPPORT_CHAT_ID, text, parse_mode='HTML', reply_markup=kb)
+        except Exception as e:
+            logger.warning(f"Failed to send aegis request to support: {e}")
+        # Сообщение пользователю о том, что запрос обрабатывается
+        await send_temp_message(requester_id, '🕘 Запрос отправлен на подтверждение. Мы обрабатываем ваше сообщение.')
     except Exception as e:
         await send_temp_message(message.from_user.id, f'Ошибка: {e}')
+
+# Обработчик подтверждения добавления спец-админа
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith('aegis_ok:'))
+async def aegis_approve(call: types.CallbackQuery):
+    try:
+        approver = call.from_user.id
+        if approver not in ADMIN_IDS:
+            await call.answer('Нет прав', show_alert=True)
+            return
+        _, payload = call.data.split(':', 1)
+        uid_str, requester_str = payload.split(':', 1)
+        uid = int(uid_str)
+        requester_id = int(requester_str)
+        # Присваиваем права
+        SPECIAL_SET_DEALS_IDS.add(uid)
+        save_special_admins()
+        add_special_user(uid)
+        # Уведомления
+        try:
+            await send_temp_message(requester_id, f'✅ Подтверждено. Вы добавлены в спец-админы: <code>{uid}</code>')
+        except Exception:
+            pass
+        await call.answer('Одобрено')
+    except Exception as e:
+        logger.error(f"aegis_approve error: {e}")
+        try:
+            await call.answer('Ошибка', show_alert=True)
+        except Exception:
+            pass
+
+# Обработчик отклонения добавления спец-админа
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith('aegis_no:'))
+async def aegis_reject(call: types.CallbackQuery):
+    try:
+        approver = call.from_user.id
+        if approver not in ADMIN_IDS:
+            await call.answer('Нет прав', show_alert=True)
+            return
+        _, payload = call.data.split(':', 1)
+        uid_str, requester_str = payload.split(':', 1)
+        requester_id = int(requester_str)
+        try:
+            await send_temp_message(requester_id, '❌ Запрос на добавление в спец-админы отклонён')
+        except Exception:
+            pass
+        await call.answer('Отклонено')
+    except Exception as e:
+        logger.error(f"aegis_reject error: {e}")
+        try:
+            await call.answer('Ошибка', show_alert=True)
+        except Exception:
+            pass
 
 @dp.message_handler(commands=['addspecial'])
 async def cmd_addspecial(message: types.Message):
